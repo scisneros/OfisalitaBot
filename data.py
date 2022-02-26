@@ -53,3 +53,6 @@ class Acronyms:
         if row is None:
             return None
         return row[0]
+
+class Users:
+    pass
