@@ -1,6 +1,6 @@
-import data
 from telegram.ext import CommandHandler, Filters
 
+import data
 from bot import updater, dp
 from commands import start, tup, desiglar, siglar, slashear, uwuspeech, get_log
 from config.auth import admin_ids

@@ -3,6 +3,8 @@ from datetime import datetime
 
 from telegram import Update
 from telegram.ext import CallbackContext
+from typing import Text
+from utils import generate_acronym, get_arg, reverse_acronym, try_msg
 
 import data
 from config.logger import log_command
@@ -44,7 +46,9 @@ def desiglar(update: Update, context: CallbackContext) -> None:
 
     message = data.Acronyms.get(arg.lower())
     if message is None:
-        message = "🤷"
+        message = reverse_acronym(arg)
+        message += "\n<i>Para hacer una sigla real:</i> /siglar"
+
     try_msg(context.bot,
             chat_id=update.message.chat_id,
             parse_mode="HTML",
@@ -109,12 +113,6 @@ def uwuspeech(update: Update, context: CallbackContext) -> None:
             chat_id=update.message.chat_id,
             parse_mode="HTML",
             text=message)
-
-
-def funa(update: Update, context: CallbackContext) -> None:
-    """
-    Cancels (funa) a user
-    """
 
 
 # Admin Commands

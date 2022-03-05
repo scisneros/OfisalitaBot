@@ -1,5 +1,7 @@
-import config.db
 import sqlite3
+from typing import Optional
+
+import config.db
 from config.logger import logger
 
 
