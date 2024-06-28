@@ -1,16 +1,16 @@
-import requests
 import data
 import json
+import re
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 from telegram.ext import CallbackContext
-from openai import OpenAI
 
-from commands.decorators import group_exclusive, member_exclusive
-from config.logger import log_command
+from ai.provider import ai_client
+from ai.base import GenAIMessage
+import ai.pricing as prc
+from commands.decorators import command
+from commands.base import Command
 from utils import (
-    try_msg,
-    get_arg,
     num_tokens_from_string,
     get_alias_dict_from_string,
     get_alias_dict_from_messages_list,
@@ -23,24 +23,17 @@ try:
 except ImportError:
     openai_key = None
 
-GPT_MODEL = "gpt-4o"
-GPT_PRICING_PER_TOKEN = {  # https://openai.com/api/pricing/
-    "gpt-4o": {"input": 0.000005, "output": 0.000015},
-    "gpt-3.5-turbo-0125": {"input": 0.0000005, "output": 0.000015},
-    "gpt-3.5-turbo-instruct": {"input": 0.0000015, "output": 0.000020},
-}
+DEFAULT_MODEL = "claude-3-sonnet-20240229"
 MAX_MESSAGES_TO_SUMMARIZE = 1000
 
-PROMPT_SYSTEM_MESSAGE_SINGLE = {
-    "role": "system",
-    "content": "Eres un bot para resumir mensajes de un chat. "
+PROMPT_SYSTEM_MESSAGE_SINGLE = (
+    "Eres un bot para resumir mensajes de un chat. "
     + "Te daré un mensaje y debes resumirlo de forma concisa. No incluyas nada más que el resumen en tu mensaje. "
-    + "Utiliza SOLO las etiquetas HTML <b> y <i> para los formatos de <b>negritas</b> e <i>itálicas</i>, NO uses ninguna otra etiqueta HTML.",
-}
+    + "Utiliza HTML para los formatos de <b>negritas</b> e <i>itálicas</i>, NO uses otras etiquetas aparte de <b> y <i>. NO uses Markdown."
+)
 
-PROMPT_SYSTEM_MESSAGE_MULTIPLE = {
-    "role": "system",
-    "content": "Eres un bot para resumir mensajes de un chat. "
+PROMPT_SYSTEM_MESSAGE_MULTIPLE = (
+    "Eres un bot para resumir mensajes de un chat. "
     + "Te daré una lista de mensajes en el siguiente formato:\n"
     + "(message_id, username, message, reply_to)\n"
     + "\n"
@@ -63,7 +56,7 @@ PROMPT_SYSTEM_MESSAGE_MULTIPLE = {
     + "(126, 24587, 'usuario2', 'ogh que paja, me carga la pap', None),"
     + "(127, 87562, 'usuario3', 'wena cabros descubrí un framework de js se llama TupJS', None),"
     + "(128, 24587, 'usuario2', 'uuu si lo cacho, apaña caleta pero me gusta más BebJS', 127),"
-    + "(129, 34924, 'usuario1', 'que chucha están hablando', None),"
+    + "(129, 34924, 'usuario1', 'que chucha están hablando', None)]"
     + "OUTPUT:\n"
     + "<b>Baloian estaba tomando pap</b>\n"
     + "- usuario1 lo vio.\n"
@@ -71,159 +64,129 @@ PROMPT_SYSTEM_MESSAGE_MULTIPLE = {
     + "<b>Conversación sobre frameworks de JS</b>\n"
     + "- usuario3 descubre TupJS.\n"
     + "- usuario2 prefiere BebJS.\n"
-    + "- usuario1 no entiende del tema.\n",
-}
+    + "- usuario1 no entiende del tema.\n"
+)
 
 
-@group_exclusive
-def resumir(update: Update, context: CallbackContext) -> None:
+@command(group_exclusive=True)
+def resumir(update: Update, context: CallbackContext, command: Command) -> None:
     """
     Summarizes multiples messages from the database.
     """
-    log_command(update)
-    try:
-        client = OpenAI(api_key=openai_key)
+    cmd = command
+    msg = update.message
 
-        # Summarize a specific single replied message
-        if not get_arg(update) and update.message.reply_to_message:
-            alias_dict = get_alias_dict_from_string(
-                update.message.reply_to_message.text
-            )
-            prompt_text = anonymize([update.message.reply_to_message.text], alias_dict)[
-                0
-            ]
-            chat_completion = client.chat.completions.create(
-                model=GPT_MODEL,
-                messages=[
-                    PROMPT_SYSTEM_MESSAGE_SINGLE,
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": prompt_text,
-                            }
-                        ],
-                    },
-                ],
-            )
-            result = chat_completion.choices[0].message.content
-            result = deanonymize(result, alias_dict)
-            message_link = f"https://t.me/c/{str(update.message.chat_id).replace('-100','')}/{update.message.reply_to_message.message_id}"
-            try:
-                try_msg(
-                    context.bot,
-                    chat_id=update.message.chat_id,
-                    parse_mode="HTML",
-                    text=f'Resumen del <a href="{message_link}">mensaje</a>:\n\n{result}',
-                    reply_to_message_id=update.message.message_id,
-                )
-            except Exception:
-                try_msg(
-                    context.bot,
-                    chat_id=update.message.chat_id,
-                    parse_mode="MarkdownV2",
-                    text=f'Resumen del <a href="{message_link}">mensaje</a>:\n\n{result}',
-                    reply_to_message_id=update.message.message_id,
-                )
-            return
+    ai_model = cmd.opts.get("m") or cmd.opts.get("model") or DEFAULT_MODEL
 
-        # Summarize N messages
-        n = None
+    client = ai_client(
+        model=ai_model, user_id=msg.from_user.id, username=msg.from_user.username
+    )
+    # Summarize a specific single replied message
+    if not cmd.arg and msg.reply_to_message:
+        alias_dict = get_alias_dict_from_string(msg.reply_to_message.text)
+        prompt_text = anonymize([msg.reply_to_message.text], alias_dict)[0]
+        response = client.generate(
+            system=PROMPT_SYSTEM_MESSAGE_SINGLE,
+            conversation=[GenAIMessage("user", prompt_text)],
+        )
+        result = deanonymize(response.message, alias_dict)
+        message_link = f"https://t.me/c/{str(msg.chat_id).replace('-100','')}/{msg.reply_to_message.message_id}"
         try:
-            n = int(get_arg(update))
-        except ValueError:
-            try_msg(
-                context.bot,
-                chat_id=update.message.chat_id,
-                text="Debes indicar la cantidad de mensajes hacia atrás que quieres resumir.",
-                reply_to_message_id=update.message.message_id,
+            msg.reply_html(
+                f'Resumen del <a href="{message_link}">mensaje</a>:\n\n{result}'
             )
+        except Exception:
+            msg.reply_markdown_v2(f"Resumen del [mensaje]({message_link}):\n\n{result}")
+        return
 
-        if n and n > MAX_MESSAGES_TO_SUMMARIZE:
-            try_msg(
-                context.bot,
-                chat_id=update.message.chat_id,
-                text=f"No puedo resumir más de {MAX_MESSAGES_TO_SUMMARIZE} mensajes a la vez.",
-                reply_to_message_id=update.message.message_id,
-            )
-            return
+    # Summarize N messages
+    n = None
+    try:
+        n = int(cmd.arg)
+    except ValueError:
+        msg.reply_text(
+            "Debes indicar la cantidad de mensajes hacia atrás que quieres resumir."
+        )
 
-        summarize_from = update.message.message_id - 1
-        if update.message.reply_to_message:
-            summarize_from = update.message.reply_to_message.message_id
+    if n and n > MAX_MESSAGES_TO_SUMMARIZE:
+        msg.reply_text(
+            f"El máximo de mensajes a resumir es de {MAX_MESSAGES_TO_SUMMARIZE}."
+        )
+        return
 
-        raw_messages = data.Messages.get_n(n, from_id=summarize_from)
-        input_messages = [
-            {
-                "message_id": m["message_id"],
-                "username": m["username"],
-                "message": m["message"],
-                "reply_to": m["reply_to"],
-            }
-            for m in raw_messages
-        ]
+    summarize_from = msg.message_id - 1
+    if msg.reply_to_message:
+        summarize_from = msg.reply_to_message.message_id
 
-        if not input_messages:
-            try_msg(
-                context.bot,
-                chat_id=update.message.chat_id,
-                text="No encontré mensajes para resumir. Es posible que lo que intentas resumir no haya sido registrado en la base de datos.",
-                reply_to_message_id=update.message.message_id,
-            )
-            return
+    raw_messages = data.Messages.get_n(n, from_id=summarize_from)
+    input_messages = [
+        {
+            "message_id": m["message_id"],
+            "username": m["username"],
+            "message": m["message"],
+            "reply_to": m["reply_to"],
+        }
+        for m in raw_messages
+    ]
 
-        prompt_messages = [
-            PROMPT_SYSTEM_MESSAGE_MULTIPLE,
-            {
-                "role": "user",
-                "content": [{"type": "text", "text": str(input_messages)}],
-            },
-        ]
+    if not input_messages:
+        msg.text(
+            "No hay mensajes para resumir. Es posible que lo que intentas resumir no haya sido registrado en la base de datos."
+        )
+        return
 
-        prompt_tokens = num_tokens_from_string(str(prompt_messages), GPT_MODEL)
-        # TODO: Calculate this based on the input messages
-        expected_completion_tokens = 300
+    prompt_messages = [
+        PROMPT_SYSTEM_MESSAGE_MULTIPLE,
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": str(input_messages)}],
+        },
+    ]
 
-        try_msg(
-            context.bot,
-            chat_id=update.message.chat_id,
-            text=f"El resumen de {len(input_messages)} mensajes costará aproximadamente ${round(prompt_tokens * GPT_PRICING_PER_TOKEN[GPT_MODEL]['input'] + expected_completion_tokens * GPT_PRICING_PER_TOKEN[GPT_MODEL]['output'], 5)} USD\n",
-            reply_to_message_id=update.message.message_id,
-            reply_markup=InlineKeyboardMarkup(
+    input_tokens = num_tokens_from_string(str(prompt_messages), DEFAULT_MODEL)
+    # TODO: Calculate this based on the input messages
+    expected_output_tokens = 300
+
+    msg.reply_html(
+        f"El resumen de {len(input_messages)} mensajes con <i>{client.model}</i> costará aproximadamente <b>${round(prc.get_total_cost(DEFAULT_MODEL, input_tokens, expected_output_tokens), 3)} USD</b>\n"
+        + (f"\nOPTS: {json.dumps(cmd.opts)}" if cmd.opts else ""),
+        reply_markup=InlineKeyboardMarkup(
+            [
                 [
-                    [
-                        InlineKeyboardButton(
-                            "Resumir",
-                            callback_data=json.dumps(
-                                ["confirm_summary", n, summarize_from]
-                            ),
+                    InlineKeyboardButton(
+                        "Resumir",
+                        callback_data=json.dumps(
+                            ["confirm_summary", n, summarize_from]
                         ),
-                        InlineKeyboardButton(
-                            "Cancelar", callback_data=json.dumps(["cancel_summary"])
-                        ),
-                    ],
-                ]
-            ),
-        )
-    except Exception as e:
-        try_msg(
-            context.bot,
-            chat_id=update.message.chat_id,
-            text=f"Hubo un error al procesar el resumen: {e}",
-            reply_to_message_id=update.message.message_id,
-        )
-        raise e
+                    ),
+                    InlineKeyboardButton(
+                        "Cancelar", callback_data=json.dumps(["cancel_summary"])
+                    ),
+                ],
+            ]
+        ),
+        quote=True,
+    )
 
 
 def _do_resumir(query: CallbackQuery, context: CallbackContext) -> None:
+    msg = query.message
     try:
-        client = OpenAI(api_key=openai_key)
+        opts = re.search(r"OPTS: (\{.*\})", msg.text)
+        ai_model = DEFAULT_MODEL
+        if opts:
+            opts = json.loads(opts.group(1))
+            ai_model = opts.get("m") or opts.get("model") or ai_model
+        client = ai_client(
+            model=ai_model,
+            user_id=msg.reply_to_message.from_user.id,
+            username=msg.reply_to_message.from_user.username,
+        )
         query_data = json.loads(query.data)
         n = query_data[1]
         summarize_from = query_data[2]
         if not summarize_from:
-            summarize_from = query.message.reply_to_message.message_id
+            summarize_from = msg.reply_to_message.message_id
 
         raw_messages = data.Messages.get_n(n, from_id=summarize_from)
         input_messages = [
@@ -238,55 +201,38 @@ def _do_resumir(query: CallbackQuery, context: CallbackContext) -> None:
         alias_dict = get_alias_dict_from_messages_list(input_messages)
         input_messages = anonymize(input_messages, alias_dict)
 
-        prompt_messages = [
-            PROMPT_SYSTEM_MESSAGE_MULTIPLE,
-            {
-                "role": "user",
-                "content": [{"type": "text", "text": str(input_messages)}],
-            },
-        ]
+        input_tokens = num_tokens_from_string(str(input_messages), DEFAULT_MODEL)
 
-        input_tokens = num_tokens_from_string(str(input_messages), GPT_MODEL)
-
-        chat_completion = client.chat.completions.create(
-            model=GPT_MODEL, messages=prompt_messages
+        response = client.generate(
+            system=PROMPT_SYSTEM_MESSAGE_MULTIPLE,
+            conversation=[GenAIMessage("user", str(input_messages))],
         )
 
-        result = chat_completion.choices[0].message.content
-        result = deanonymize(result, alias_dict)
+        result = deanonymize(response.message, alias_dict)
 
-        start_message_link = f"https://t.me/c/{str(query.message.chat_id).replace('-100','')}/{input_messages[0]['message_id']}"
-        end_message_link = f"https://t.me/c/{str(query.message.chat_id).replace('-100','')}/{input_messages[-1]['message_id']}"
-
+        start_message_link = f"https://t.me/c/{str(msg.chat_id).replace('-100','')}/{input_messages[0]['message_id']}"
+        end_message_link = f"https://t.me/c/{str(msg.chat_id).replace('-100','')}/{input_messages[-1]['message_id']}"
         final_message = (
             f'Resumen de {len(input_messages)} mensajes [<a href="{start_message_link}">Inicio</a> - <a href="{end_message_link}">Fin</a>]:\n'
-            + f"<i>Costo: ${round(chat_completion.usage.prompt_tokens * GPT_PRICING_PER_TOKEN[GPT_MODEL]['input'] + chat_completion.usage.completion_tokens * GPT_PRICING_PER_TOKEN[GPT_MODEL]['output'], 5)} USD</i>\n"
-            + f"<i>Tokens input: {input_tokens}, Tokens output: {chat_completion.usage.completion_tokens}, Ratio: {int(chat_completion.usage.completion_tokens)/input_tokens}</i>\n\n"
+            + f"<i>Costo: ${round(response.cost, 5)} USD</i>\n"
+            + f"<i>Tokens input: {input_tokens}, Tokens output: {response.usage['output']}, Ratio: {int(response.usage['output'])/input_tokens}</i>\n\n"
             + str(result)
         )
         try:
-            try_msg(
-                context.bot,
-                chat_id=query.message.chat_id,
-                parse_mode="HTML",
-                text=final_message,
-                reply_to_message_id=query.message.reply_to_message.message_id,
+            msg.reply_html(
+                f'Resumen de {len(input_messages)} mensajes [<a href="{start_message_link}">Inicio</a> - <a href="{end_message_link}">Fin</a>]:\n'
+                + f"<i>Costo: ${round(response.cost, 5)} USD</i>\n"
+                + f"<i>Tokens input: {input_tokens}, Tokens output: {response.usage['output']}, Ratio: {int(response.usage['output'])/input_tokens}</i>\n\n"
+                + str(result),
+                reply_to_message_id=msg.reply_to_message.message_id,
             )
         except Exception:
-            try_msg(
-                context.bot,
-                chat_id=query.message.chat_id,
-                parse_mode="MarkdownV2",
-                text=final_message,
-                reply_to_message_id=query.message.reply_to_message.message_id,
+            msg.reply_markdown_v2(
+                final_message,
+                reply_to_message_id=msg.reply_to_message.message_id,
             )
     except Exception as e:
-        try_msg(
-            context.bot,
-            chat_id=query.message.chat_id,
-            text=f"Hubo un error al procesar el resumen: {e}",
-            reply_to_message_id=query.message.reply_to_message.message_id,
-        )
+        msg.reply_text(f"Ocurrió un error al procesar el resumen:\n{e}")
         raise e
 
 

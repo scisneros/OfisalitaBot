@@ -248,7 +248,10 @@ def guard_editable_bot_message(update: Update,
 
 def num_tokens_from_string(string: str, model: str) -> int:
     """Returns the number of tokens in a text string."""
-    encoding = tiktoken.encoding_for_model(model)
+    try:
+        encoding = tiktoken.encoding_for_model(model)
+    except KeyError:
+        encoding = tiktoken.encoding_for_model("gpt-4o")
     num_tokens = len(encoding.encode(string))
     return num_tokens
 
